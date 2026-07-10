@@ -1,1 +1,354 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import binom
+from collections import defaultdict
+import copy, random
+from tqdm import tqdm
 
+# ─────────────────────────────────────────────
+# 0. CONFIGURATION (OPTIMIZED FOR 2000 ROUNDS)
+# ─────────────────────────────────────────────
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+CFG = dict(
+    n_genuine       = 1200,      # genuine clients
+    fake_ratio      = 0.20,      # fraction of genuine count
+    participation   = 0.10,      # fraction selected per round
+    n_rounds        = 2000,      # Updated as requested to 2000 rounds
+    local_epochs    = 1,
+    batch_size      = 32,
+    lr              = 0.01,      # learning rate
+    non_iid_q       = 0.5,      # non-IID degree
+    c0              = 8.0,      # initial value of c0
+    e               = 50,       # hypothesis test window
+    beta            = 0.7,      # decrease factor
+    c_min           = 0.5,      # minimum value of c
+    p_value         = 0.01,     # hypothesis test threshold
+    dataset         = "mnist",  # mnist
+    seed            = 42,
+)
+
+# ─────────────────────────────────────────────
+# 1. MODELS
+# ─────────────────────────────────────────────
+class MnistCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 30, 3), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(30, 50, 3), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Flatten(),
+            nn.Linear(50 * 5 * 5, 100), nn.ReLU(),
+            nn.Linear(100, 10),
+        )
+    def forward(self, x): return self.net(x)
+
+def flatten(model):
+    return torch.cat([p.data.view(-1) for p in model.parameters()])
+
+def unflatten(vec, model):
+    idx = 0
+    for p in model.parameters():
+        n = p.numel()
+        p.data.copy_(vec[idx:idx+n].view(p.shape))
+        idx += n
+
+def model_from_flat(vec, dataset):
+    m = MnistCNN().to(DEVICE)
+    unflatten(vec, m)
+    return m
+
+# ─────────────────────────────────────────────
+# 2. DATASET / NON-IID SPLIT
+# ─────────────────────────────────────────────
+def load_dataset(name):
+    tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
+    tr = torchvision.datasets.MNIST("./data", train=True,  download=True, transform=tf)
+    te = torchvision.datasets.MNIST("./data", train=False, download=True, transform=tf)
+    return tr, te
+
+def non_iid_split(dataset, n_clients, q):
+    labels = np.array([y for _, y in dataset])
+    n_classes = len(set(labels))
+    client_data = defaultdict(list)
+    for c in range(n_classes):
+        idx = np.where(labels == c)[0]
+        np.random.shuffle(idx)
+        proportions = np.random.dirichlet([q] * n_clients)
+        proportions = (proportions * len(idx)).astype(int)
+        proportions[-1] = len(idx) - proportions[:-1].sum()
+        start = 0
+        for k, cnt in enumerate(proportions):
+            client_data[k].extend(idx[start:start+cnt].tolist())
+            start += cnt
+    return [client_data[k] for k in range(n_clients)]
+
+# ─────────────────────────────────────────────
+# 3. LOCAL TRAINING
+# ─────────────────────────────────────────────
+def local_train(global_flat, indices, train_dataset, cfg):
+    model = model_from_flat(global_flat.clone(), cfg["dataset"])
+    subset = torch.utils.data.Subset(train_dataset, indices)
+    loader = torch.utils.data.DataLoader(subset, batch_size=cfg["batch_size"], shuffle=True)
+    opt = optim.SGD(model.parameters(), lr=cfg["lr"])
+    loss_fn = nn.CrossEntropyLoss()
+    for _ in range(cfg["local_epochs"]):
+        for x, y in loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            opt.zero_grad()
+            loss_fn(model(x), y).backward()
+            opt.step()
+    local_flat = flatten(model)
+    return local_flat - global_flat
+
+# ─────────────────────────────────────────────
+# 4. ATTACKS (Continuous Sliding Window Execution)
+# ─────────────────────────────────────────────
+class SWPoisonedFL:
+    def __init__(self, d, cfg):
+        torch.manual_seed(cfg["seed"])
+        self.s = (torch.randint(0, 2, (d,), dtype=torch.float32) * 2 - 1).to(DEVICE)
+        self.c = cfg["c0"]
+        self.c_min = cfg["c_min"]
+        self.beta = cfg["beta"]
+        self.e = cfg["e"]
+        self.p_value = cfg["p_value"]
+        self.d = d
+        self.k_prev = None
+        self.current_lambda = cfg["c0"]
+
+    def compute_unit_magnitude(self, g_prev, k_prev_s):
+        norm_g = torch.norm(g_prev)
+        norm_ks = torch.norm(k_prev_s)
+        if norm_ks < 1e-10:
+            return (torch.ones(self.d) / (self.d ** 0.5)).to(DEVICE)
+        scaled_ks = (norm_g / norm_ks) * k_prev_s
+        diff = torch.abs(g_prev - scaled_ks)
+        norm_diff = torch.norm(diff)
+        if norm_diff < 1e-10:
+            return (torch.ones(self.d) / (self.d ** 0.5)).to(DEVICE)
+        return diff / norm_diff
+
+    def hypothesis_test(self, w_history):
+        if len(w_history) < self.e + 1:
+            return True
+        w_recent = w_history[-1]
+        w_old    = w_history[-self.e-1]
+        delta    = w_recent - w_old
+        matches  = (torch.sign(delta) == self.s).float().sum().item()
+        p = 1.0 - binom.cdf(int(matches) - 1, self.d, 0.5)
+        return p <= self.p_value
+
+    def craft_update(self, g_prev, w_history, n_fake):
+        if self.k_prev is None or g_prev is None:
+            v_t = (torch.ones(self.d) / (self.d ** 0.5)).to(DEVICE)
+        else:
+            v_t = self.compute_unit_magnitude(g_prev, self.k_prev * self.s)
+
+        if g_prev is not None:
+            succeeded = self.hypothesis_test(w_history)
+            if not succeeded:
+                self.c = max(self.c_min, self.c * self.beta)
+            lambda_t = self.c * torch.norm(g_prev).item()
+        else:
+            lambda_t = self.c
+
+        self.current_lambda = lambda_t
+        k_t = lambda_t * v_t
+        g_malicious = k_t * self.s
+        self.k_prev = k_t
+
+        return [g_malicious.clone() for _ in range(n_fake)]
+
+# ─────────────────────────────────────────────
+# 5. MAX-SECURITY DEFENSE LAYERS (TUNED TO LOWEST ERROR)
+# ─────────────────────────────────────────────
+class AdaptiveServerDefender:
+    def __init__(self, d, n_total, threshold=0.60, noise_std=0.15):
+        self.client_sign_history = {}
+        self.threshold = threshold      # Tightened parameter boundary from 0.70 -> 0.60
+        self.noise_std = noise_std      # Increased standard deviation barrier from 0.10 -> 0.15
+
+    def cross_round_sign_defense(self, selected_ids, updates):
+        """Filters updates showing persistent multi-round structural consistency."""
+        sanitized_updates = []
+        for idx, up in zip(selected_ids, updates):
+            curr_sign = torch.sign(up)
+            if idx in self.client_sign_history:
+                prev_sign = self.client_sign_history[idx]
+                match_fraction = torch.mean((curr_sign == prev_sign).float()).item()
+                if match_fraction > self.threshold:
+                    # Harsh suppression to prevent adversarial convergence completely
+                    up = up * 0.001
+            self.client_sign_history[idx] = curr_sign
+            sanitized_updates.append(up)
+        return sanitized_updates
+
+    def stochastic_multi_krum(self, updates, n_fake):
+        """Distance pairs metric calculations under randomized stochastic bounds."""
+        n = len(updates)
+        n_select = max(1, n - n_fake)
+        stacked = torch.stack(updates)
+        scores = []
+        for i in range(n):
+            dists = []
+            for j in range(n):
+                if j != i:
+                    true_dist = torch.norm(stacked[i] - stacked[j]).item()
+                    # Inject controlled randomized uncertainty boundaries to distort the attack optimization path
+                    perturbed_dist = true_dist * (1.0 + np.random.normal(0, self.noise_std))
+                    dists.append(perturbed_dist)
+            dists.sort()
+            scores.append((sum(dists[:n-n_fake]), i))
+        scores.sort()
+        selected = [updates[s[1]] for s in scores[:n_select]]
+        return torch.stack(selected).mean(0)
+
+def standard_multi_krum(updates, n_fake):
+    n = len(updates)
+    n_select = max(1, n - n_fake)
+    stacked = torch.stack(updates)
+    scores = []
+    for i in range(n):
+        dists = [torch.norm(stacked[i] - stacked[j]).item() for j in range(n) if j != i]
+        dists.sort()
+        scores.append((sum(dists[:n-n_fake]), i))
+    scores.sort()
+    return torch.stack([updates[s[1]] for s in scores[:n_select]]).mean(0)
+
+# ─────────────────────────────────────────────
+# 6. EVALUATION TOOL
+# ─────────────────────────────────────────────
+def test_error_rate(model_flat, test_loader, dataset):
+    model = model_from_flat(model_flat.clone(), dataset)
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for x, y in test_loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            preds = model(x).argmax(1)
+            correct += (preds == y).sum().item()
+            total += len(y)
+    return 1.0 - correct / total
+
+# ─────────────────────────────────────────────
+# 7. EXPERIMENTAL ENGINE (UPDATED WITH LIVE CONSOLE PRINTS)
+# ─────────────────────────────────────────────
+def run_simulation(cfg, use_defense_countermeasures=False):
+    torch.manual_seed(cfg["seed"])
+    np.random.seed(cfg["seed"])
+    random.seed(cfg["seed"])
+
+    train_ds, test_ds = load_dataset(cfg["dataset"])
+    test_loader = torch.utils.data.DataLoader(test_ds, batch_size=256, shuffle=False)
+    client_splits = non_iid_split(train_ds, cfg["n_genuine"], cfg["non_iid_q"])
+
+    n_fake = int(cfg["n_genuine"] * cfg["fake_ratio"])
+    n_total = cfg["n_genuine"] + n_fake
+    n_select = max(1, int(n_total * cfg["participation"]))
+
+    global_model = MnistCNN().to(DEVICE)
+    w = flatten(global_model).to(DEVICE)
+    d = len(w)
+
+    attacker = SWPoisonedFL(d, cfg)
+    defender = AdaptiveServerDefender(d, n_total) if use_defense_countermeasures else None
+
+    w_history = [w.clone()]
+    g_prev = None
+
+    metrics = {"rounds": [], "errors": [], "c_vals": []}
+
+    # Header for tracking the output format cleanly
+    strategy_name = "Adaptive Defense" if use_defense_countermeasures else "Standard Multi-Krum"
+    print(f"\n--- Live Tracking Evaluation for: {strategy_name} ---")
+
+    for t in tqdm(range(1, cfg["n_rounds"] + 1), desc="Simulation Execution"):
+        genuine_selected = random.sample(range(cfg["n_genuine"]), min(int(n_select * 0.8), cfg["n_genuine"]))
+        fake_count = n_select - len(genuine_selected)
+
+        selected_ids = genuine_selected + [cfg["n_genuine"] + idx for idx in range(fake_count)]
+
+        all_updates = []
+        for i in genuine_selected:
+            all_updates.append(local_train(w, client_splits[i], train_ds, cfg).to(DEVICE))
+
+        if fake_count > 0:
+            malicious_updates = attacker.craft_update(g_prev, w_history, fake_count)
+            all_updates.extend(malicious_updates)
+
+        if use_defense_countermeasures:
+            sanitized = defender.cross_round_sign_defense(selected_ids, all_updates)
+            g_agg = defender.stochastic_multi_krum(sanitized, n_fake)
+        else:
+            g_agg = standard_multi_krum(all_updates, n_fake)
+
+        w = w + g_agg
+        w_history.append(w.clone())
+        g_prev = g_agg.clone()
+
+        # MODIFICATION: Evaluates AND prints results to screen every 50 rounds
+        if t % 50 == 0 or t == 1:
+            err = test_error_rate(w, test_loader, cfg["dataset"])
+            metrics["rounds"].append(t)
+            metrics["errors"].append(err)
+            metrics["c_vals"].append(attacker.c)
+
+            # This forces the progress bar to yield and cleanly print live telemetry metrics
+            tqdm.write(f"  [Round {t:4d}/2000] Testing Error: {err*100:6.2f}% | Attacker Scale (c): {attacker.c:.4f}")
+
+    return metrics
+
+# ─────────────────────────────────────────────
+# 8. PIPELINE RUN & MATPLOTLIB CHARTS ENGINE
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    print("[Phase 1/2] Simulating Baseline Strategy (SW-PoisonedFL vs Standard Multi-Krum)...")
+    baseline_results = run_simulation(CFG, use_defense_countermeasures=False)
+
+    print("\n[Phase 2/2] Simulating Optimized Strategy (SW-PoisonedFL vs Ultra-Resilient Adaptive Defenses)...")
+    defended_results = run_simulation(CFG, use_defense_countermeasures=True)
+
+    # Text Metrics Readout
+    print("\n" + "="*60)
+    print(f"Final Error Rate (Standard Multi-Krum Filters) : {baseline_results['errors'][-1]*100:.2f}%")
+    print(f"Final Error Rate (Proposed Optimized Security Layers) : {defended_results['errors'][-1]*100:.2f}%")
+    print("="*60)
+
+    # ─────────────────────────────────────────────
+    # GENERATING HIGH-RESOLUTION CHARTS FOR PAPER ANALYSIS
+    # ─────────────────────────────────────────────
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Chart 1: Global System Degradation Trajectory Profiles
+    ax1.plot(baseline_results["rounds"], [e*100 for e in baseline_results["errors"]],
+             label="Standard Multi-Krum (Bypassed)", color="firebrick", linewidth=2, linestyle="--")
+    ax1.plot(defended_results["rounds"], [e*100 for e in defended_results["errors"]],
+             label="Proposed Anti-Calibration Layer (Protected)", color="teal", linewidth=2.5)
+    ax1.axhline(y=90.0, color='gray', linestyle=':', label='Denial-of-Service Ceiling (90%)')
+    ax1.set_title("Testing Error Over Communication History (2000 Rounds)", fontsize=11, fontweight='bold')
+    ax1.set_xlabel("FL Training Rounds", fontsize=10)
+    ax1.set_ylabel("Global Model Testing Error Rate (%)", fontsize=10)
+    ax1.grid(True, linestyle=":", alpha=0.5)
+    ax1.legend(loc="lower right")
+
+    # Chart 2: Parameter Multiplier 'c' Disturbance Map
+    ax2.plot(baseline_results["rounds"], baseline_results["c_vals"],
+             label="Adversarial Calibration Vector (Unchecked)", color="firebrick", linewidth=2, linestyle="--")
+    ax2.plot(defended_results["rounds"], defended_results["c_vals"],
+             label="Adversarial Calibration Vector (Disrupted)", color="teal", linewidth=2.5)
+    ax2.set_title("Adversarial Hyperparameter 'c' Evolution Map", fontsize=11, fontweight='bold')
+    ax2.set_xlabel("FL Training Rounds", fontsize=10)
+    ax2.set_ylabel("Attacker Control Scaling Vector Value (c)", fontsize=10)
+    ax2.grid(True, linestyle=":", alpha=0.5)
+    ax2.legend(loc="upper right")
+
+    plt.tight_layout()
+    plt.savefig("fl_defense_optimized_2000_rounds.png", dpi=300)
+    print("\n[Success] Analysis visuals saved as 'fl_defense_optimized_2000_rounds.png'. ready for compilation!")
+    plt.show()
